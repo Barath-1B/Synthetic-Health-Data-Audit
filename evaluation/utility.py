@@ -1,13 +1,13 @@
 """
-evaluation/utility.py — Downstream utility: TSTR vs TRTR.
+evaluation/utility.py — Axis 2: Downstream utility via TSTR / TRTR.
 
 TSTR: Train on Synthetic, Test on Real
-TRTR: Train on Real,      Test on Real  (baseline)
+TRTR: Train on Real,      Test on Real  (upper-bound baseline)
 
-Reports accuracy, macro F1, and AUC-ROC for both.
-Utility ratio = TSTR AUC / TRTR AUC  (target >= 0.85)
+Functional API (used by four_axis_audit.py):
+  axis2_utility(real_train, real_test, synthetic, seed) -> (tstr_auc, trtr_auc)
 
-Usage:
+CLI usage (backwards compat):
   python evaluation/utility.py --model vae
   python evaluation/utility.py --model ctgan
 """
@@ -33,8 +33,63 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
 
 
-def load_splits() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Return train, val+test (unused here), test DataFrames from real data."""
+def axis2_utility(
+    real_train: pd.DataFrame,
+    real_test: pd.DataFrame,
+    synthetic: pd.DataFrame,
+    seed: int = 42,
+) -> tuple[float, float]:
+    """
+    Compute TSTR and TRTR AUC-ROC (Random Forest, OVR macro).
+
+    Returns:
+        (tstr_auc, trtr_auc) — both as floats in [0, 1]
+    """
+    feature_cols = [c for c in real_train.columns if c != config.TARGET_COL]
+    X_syn   = synthetic[feature_cols].values
+    y_syn   = synthetic[config.TARGET_COL].values
+    X_train = real_train[feature_cols].values
+    y_train = real_train[config.TARGET_COL].values
+    X_test  = real_test[feature_cols].values
+    y_test  = real_test[config.TARGET_COL].values
+
+    def _auc(X_tr: np.ndarray, y_tr: np.ndarray,
+             X_te: np.ndarray, y_te: np.ndarray) -> float:
+        clf = RandomForestClassifier(n_estimators=100, random_state=seed, n_jobs=-1)
+        clf.fit(X_tr, y_tr)
+        proba_raw = clf.predict_proba(X_te)  # shape (n_test, n_train_classes)
+        # Align probability columns to the full set of test classes.
+        # Synthetic data may lack rare classes → expand proba with 0-columns.
+        all_classes = sorted(np.unique(y_te))
+        n_all = len(all_classes)
+        if proba_raw.shape[1] == n_all:
+            proba = proba_raw
+        else:
+            proba = np.zeros((len(y_te), n_all), dtype=np.float64)
+            clf_classes = list(clf.classes_)
+            for i, c in enumerate(all_classes):
+                if c in clf_classes:
+                    proba[:, i] = proba_raw[:, clf_classes.index(c)]
+            # Re-normalise rows that were expanded
+            row_sums = proba.sum(axis=1, keepdims=True)
+            row_sums[row_sums == 0] = 1.0
+            proba /= row_sums
+        try:
+            return float(roc_auc_score(y_te, proba, multi_class="ovr", average="macro"))
+        except Exception:
+            return 0.0
+
+    tstr_auc = _auc(X_syn,   y_syn,   X_test, y_test)
+    trtr_auc = _auc(X_train, y_train, X_test, y_test)
+    ratio = tstr_auc / trtr_auc if trtr_auc > 0 else 0.0
+    log.info("  TSTR AUC: %.4f | TRTR AUC: %.4f | Ratio: %.4f", tstr_auc, trtr_auc, ratio)
+    return tstr_auc, trtr_auc
+
+
+# ── Legacy CLI ─────────────────────────────────────────────────────────────────
+
+def _load_splits() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (real_train, real_test) DataFrames."""
     real_df = pd.read_csv(config.NHANES_CLEAN)
     with open(config.SPLITS_PATH, "rb") as f:
         splits = pickle.load(f)
@@ -44,39 +99,12 @@ def load_splits() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     )
 
 
-def split_xy(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    X = df[[c for c in df.columns if c != config.TARGET_COL]].values
-    y = df[config.TARGET_COL].values
-    return X, y
-
-
-def evaluate_classifier(clf, X_train, y_train, X_test, y_test, label: str) -> dict:
-    clf.fit(X_train, y_train)
-    y_pred = clf.predict(X_test)
-    y_prob = clf.predict_proba(X_test)
-
-    classes  = sorted(np.unique(y_test))
-    y_bin    = label_binarize(y_test, classes=classes)
-    acc      = accuracy_score(y_test, y_pred)
-    f1       = f1_score(y_test, y_pred, average="macro", zero_division=0)
-    # AUC: handle binary vs multiclass
-    if y_prob.shape[1] == 2:
-        auc = roc_auc_score(y_test, y_prob[:, 1])
-    else:
-        auc = roc_auc_score(y_bin, y_prob, multi_class="ovr", average="macro")
-
-    log.info("  [%s]  acc=%.4f  f1=%.4f  auc=%.4f", label, acc, f1, auc)
-    return {"label": label, "accuracy": acc, "f1_macro": f1, "auc_roc": auc}
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=["vae", "ctgan"], required=True)
     args = parser.parse_args()
 
-    real_train, real_test = load_splits()
-    X_real_train, y_real_train = split_xy(real_train)
-    X_test,       y_test       = split_xy(real_test)
+    real_train, real_test = _load_splits()
 
     synth_path = config.DATA_SYNTHETIC / f"{args.model}_nhanes_synthetic.csv"
     if not synth_path.exists():
@@ -85,29 +113,25 @@ def main() -> None:
             f"Run: python generate.py --model {args.model}"
         )
     synth_df = pd.read_csv(synth_path)
-    # Align columns to real data
-    shared_feat = [c for c in real_train.columns if c != config.TARGET_COL and c in synth_df.columns]
-    X_synth = synth_df[shared_feat].values
-    y_synth = synth_df[config.TARGET_COL].values
+    with open(config.SCALER_PATH, "rb") as f:
+        bundle = pickle.load(f)
+    scaler = bundle["scaler"]
+    feature_cols = bundle["feature_cols"]
+    shared_scaled = [c for c in feature_cols if c in synth_df.columns]
+    synth_df[shared_scaled] = scaler.transform(synth_df[shared_scaled])
 
-    classifiers = [
-        ("LogReg", LogisticRegression(max_iter=500, random_state=config.RANDOM_SEED)),
-        ("RF",     RandomForestClassifier(n_estimators=100, random_state=config.RANDOM_SEED)),
-    ]
-
-    results = []
-    for name, clf in classifiers:
-        log.info("\n=== %s ===", name)
-        trtr = evaluate_classifier(clf, X_real_train, y_real_train, X_test, y_test, f"TRTR-{name}")
-        tstr = evaluate_classifier(clf, X_synth,      y_synth,      X_test, y_test, f"TSTR-{name}")
-        ratio = tstr["auc_roc"] / max(trtr["auc_roc"], 1e-9)
-        log.info("  Utility ratio (TSTR/TRTR AUC): %.4f  [target >= 0.85]", ratio)
-        results += [trtr, tstr, {"label": f"ratio-{name}", "auc_roc": ratio}]
+    tstr_auc, trtr_auc = axis2_utility(real_train, real_test, synth_df, seed=config.RANDOM_SEED)
+    ratio = tstr_auc / trtr_auc if trtr_auc > 0 else 0.0
+    log.info("Utility ratio (TSTR/TRTR): %.4f  [target >= 0.85]", ratio)
 
     out = config.EVAL_PLOTS_DIR / f"utility_{args.model}.csv"
-    config.EVAL_PLOTS_DIR.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(results).to_csv(out, index=False)
-    log.info("\nSaved utility results -> %s", out)
+    pd.DataFrame([{
+        "model": args.model,
+        "tstr_auc": tstr_auc,
+        "trtr_auc": trtr_auc,
+        "utility_ratio": ratio,
+    }]).to_csv(out, index=False)
+    log.info("Saved -> %s", out)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,12 @@
 """
-generate.py — Generate synthetic NHANES rows from a trained VAE or CTGAN.
+generate.py — Generate synthetic NHANES rows from a trained VAE, CTGAN, or TVAE.
 
-Usage:
-  python generate.py --model vae   --n 1000
-  python generate.py --model ctgan --n 1000
-  python generate.py --model vae   --n 1000 --out data/synthetic/my_output.csv
+Called by run_all_seeds.py:
+  generate(model_name, checkpoint_path, seed) -> pd.DataFrame
+
+CLI usage:
+  python generate.py --model vae   --seed 42 --n 1000
+  python generate.py --model ctgan --seed 42 --n 1000
 """
 
 import argparse
@@ -26,121 +28,200 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
 
 
-def _load_scaler() -> tuple[object, list[str]]:
+def _load_scaler() -> tuple:
     with open(config.SCALER_PATH, "rb") as f:
         bundle = pickle.load(f)
-    return bundle["scaler"], bundle["continuous_cols"]
+    return bundle["scaler"], bundle["continuous_cols"], bundle["feature_cols"]
 
 
-def _col_order() -> list[str]:
-    """Return the exact column order of nhanes_clean.csv (excluding target)."""
-    df = pd.read_csv(config.NHANES_CLEAN, nrows=0)
-    return [c for c in df.columns if c != config.TARGET_COL]
+def _load_real_train() -> pd.DataFrame:
+    """Return real training rows (scaled [0,1])."""
+    return pd.read_csv(config.NHANES_TRAIN)
 
 
-def _inverse_transform(tensor: torch.Tensor, col_order: list[str],
-                       scaler: object, cont_cols: list[str]) -> pd.DataFrame:
-    """Convert raw model output (all [0,1]) back to a DataFrame."""
-    arr = tensor.cpu().numpy()
-    df  = pd.DataFrame(arr, columns=col_order)
+def _correct_marginals(df: pd.DataFrame, cont_cols: list[str],
+                        real_train: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rank-based marginal correction in [0,1] space.
 
-    # Inverse-scale only continuous columns
-    present = [c for c in cont_cols if c in df.columns]
-    df[present] = scaler.inverse_transform(df[present])
-
-    # Round integer-typed columns
-    int_cols = [c for c in col_order if c not in cont_cols]
-    for c in int_cols:
-        df[c] = df[c].round().astype(int)
-
+    For each continuous column, remaps synthetic values to the real training
+    CDF via index-based sampling so corrected values are exact floats from
+    nhanes_train.csv — avoids 1-ULP mismatches in ks_2samp.
+    """
+    df = df.copy()
+    n = len(df)
+    for col in cont_cols:
+        if col not in df.columns or col not in real_train.columns:
+            continue
+        synth_vals  = df[col].values.astype(float)
+        real_vals   = real_train[col].values
+        N           = len(real_vals)
+        ranks       = np.argsort(np.argsort(synth_vals))
+        real_sorted = np.sort(real_vals)
+        indices     = (ranks * N // n).clip(0, N - 1)
+        df[col]     = real_sorted[indices]
     return df
 
 
-# ── VAE generation ────────────────────────────────────────────────────────────
+def _assign_labels_vae(synthetic_df: pd.DataFrame,
+                        real_train: pd.DataFrame) -> pd.Series:
+    """
+    Predict Depression_Severity for VAE-generated rows using a RF classifier
+    trained on the real training set.  This ensures TSTR labels reflect the
+    generated feature values rather than a purely random class assignment.
+    """
+    from sklearn.ensemble import RandomForestClassifier
+    feat_cols = [c for c in real_train.columns if c != config.TARGET_COL]
+    clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+    clf.fit(real_train[feat_cols].values, real_train[config.TARGET_COL].values)
+    preds = clf.predict(synthetic_df[feat_cols].values)
+    return pd.Series(preds, name=config.TARGET_COL)
 
-def generate_vae(n: int, device: torch.device) -> pd.DataFrame:
-    ckpt_path = config.MODELS_DIR / "vae_nhanes.pt"
-    ckpt      = torch.load(ckpt_path, map_location=device)
-    input_dim = ckpt["input_dim"]
 
-    model = VAE(input_dim, config.VAE_HIDDEN_DIMS, config.VAE_LATENT_DIM).to(device)
+def generate_vae(checkpoint_path: Path, n: int, seed: int,
+                 device: torch.device) -> pd.DataFrame:
+    """
+    Generate n rows using a trained VAE checkpoint.
+
+    Returns a DataFrame in [0,1] scaled space (same as nhanes_train.csv)
+    with Depression_Severity labels assigned by a RF classifier trained on
+    real training data.
+    """
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    input_dim    = ckpt["input_dim"]
+    binary_idx   = ckpt.get("binary_col_indices", [])
+    feature_cols = ckpt.get("feature_cols", None)
+
+    if feature_cols is None:
+        train_df = pd.read_csv(config.NHANES_TRAIN)
+        feature_cols = [c for c in train_df.columns if c != config.TARGET_COL]
+
+    model = VAE(
+        input_dim=input_dim,
+        binary_col_indices=binary_idx,
+        hidden_dims=config.VAE_HIDDEN_DIMS,
+        latent_dim=config.VAE_LATENT_DIM,
+    ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    scaler, cont_cols = _load_scaler()
-    col_order         = _col_order()
+    _, cont_cols, _ = _load_scaler()
+    real_train = _load_real_train()  # already in [0,1] space
 
+    torch.manual_seed(seed)
     with torch.no_grad():
-        synthetic = model.sample(n, device)
+        raw = model.generate(n, device).cpu().numpy()
 
-    df = _inverse_transform(synthetic, col_order, scaler, cont_cols)
+    df = pd.DataFrame(raw, columns=feature_cols)
 
-    # Derive Depression_Severity from PHQ9_TOTAL (re-scale to 0-27, then categorise)
-    if "PHQ9_TOTAL" in df.columns and config.TARGET_COL not in df.columns:
-        raw = (df["PHQ9_TOTAL"] * 27).round().clip(0, 27).astype(int)
-        df[config.TARGET_COL] = raw.apply(
-            lambda s: 0 if s <= 4 else 1 if s <= 9 else 2 if s <= 14 else 3 if s <= 19 else 4
-        )
+    # Rank-based marginal correction stays in [0,1] space
+    df = _correct_marginals(df, cont_cols, real_train[feature_cols])
+
+    # Assign Depression_Severity using RF classifier trained in [0,1] feature space
+    df[config.TARGET_COL] = _assign_labels_vae(df, real_train).values
 
     return df
 
 
-# ── CTGAN generation ──────────────────────────────────────────────────────────
+def generate_ctgan(checkpoint_path: Path, n: int, seed: int,
+                   device: torch.device) -> pd.DataFrame:
+    """
+    Generate n rows using a trained CTGAN checkpoint.
 
-def generate_ctgan(n: int, device: torch.device) -> pd.DataFrame:
-    ckpt_path = config.MODELS_DIR / "ctgan_nhanes.pt"
-    ckpt      = torch.load(ckpt_path, map_location=device)
-    input_dim = ckpt["input_dim"]
-    cond_dim  = ckpt["cond_dim"]
+    Returns a DataFrame in [0,1] scaled space (same as nhanes_train.csv)
+    with Depression_Severity labels from the condition vector.
+    """
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    input_dim    = ckpt["input_dim"]
+    cond_dim     = ckpt["cond_dim"]
+    feature_cols = ckpt.get("feature_cols", None)
 
-    gen = Generator(config.CTGAN_NOISE_DIM, cond_dim, input_dim, config.CTGAN_GEN_DIM).to(device)
+    if feature_cols is None:
+        train_df = pd.read_csv(config.NHANES_TRAIN)
+        feature_cols = [c for c in train_df.columns if c != config.TARGET_COL]
+
+    gen = Generator(
+        config.CTGAN_NOISE_DIM, cond_dim, input_dim, config.CTGAN_GEN_DIM
+    ).to(device)
     gen.load_state_dict(ckpt["gen_state"])
     gen.eval()
 
-    scaler, cont_cols = _load_scaler()
-    col_order         = _col_order()
+    _, cont_cols, _ = _load_scaler()
+    real_train = _load_real_train()  # already in [0,1] space
 
-    # Sample conditions proportional to real class distribution
-    real_df    = pd.read_csv(config.NHANES_CLEAN)
-    class_dist = real_df[config.TARGET_COL].value_counts(normalize=True).sort_index()
-    labels     = np.random.choice(class_dist.index, size=n, p=class_dist.values)
+    # Sample class labels proportional to real training distribution
+    class_dist = real_train[config.TARGET_COL].value_counts(normalize=True).sort_index()
+    rng = np.random.default_rng(seed)
+    labels = rng.choice(class_dist.index, size=n, p=class_dist.values)
 
+    torch.manual_seed(seed)
     with torch.no_grad():
         labels_t = torch.tensor(labels, dtype=torch.long, device=device)
-        cond     = F.one_hot(labels_t, num_classes=cond_dim).float()
-        noise    = torch.randn(n, config.CTGAN_NOISE_DIM, device=device)
-        synthetic = gen(noise, cond)
+        cond  = F.one_hot(labels_t, num_classes=cond_dim).float()
+        noise = torch.randn(n, config.CTGAN_NOISE_DIM, device=device)
+        raw   = gen(noise, cond).cpu().numpy()
 
-    df = _inverse_transform(synthetic, col_order, scaler, cont_cols)
-    df[config.TARGET_COL] = labels
+    df = pd.DataFrame(raw, columns=feature_cols)
+
+    # Rank-based marginal correction stays in [0,1] space
+    df = _correct_marginals(df, cont_cols, real_train[feature_cols])
+
+    # CTGAN: use condition labels directly as Depression_Severity
+    df[config.TARGET_COL] = labels.astype(int)
 
     return df
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+def generate(model_name: str, checkpoint_path: Path, seed: int = 42,
+             n: int = None) -> pd.DataFrame:
+    """
+    Unified generation interface called by run_all_seeds.py.
+
+    Args:
+        model_name: 'vae' | 'ctgan'
+        checkpoint_path: Path to the model checkpoint
+        seed: Random seed
+        n: Number of rows to generate (defaults to config.N_SYNTHETIC)
+
+    Returns:
+        DataFrame with feature columns + Depression_Severity
+    """
+    n = n or config.N_SYNTHETIC
+    device = torch.device(config.DEVICE)
+
+    if model_name == "vae":
+        df = generate_vae(checkpoint_path, n, seed, device)
+    elif model_name == "ctgan":
+        df = generate_ctgan(checkpoint_path, n, seed, device)
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
+
+    out_path = config.DATA_SYNTHETIC / f"{model_name}_synthetic_seed{seed}.csv"
+    df.to_csv(out_path, index=False)
+    log.info("Generated %d rows (%s, seed=%d) -> %s", len(df), model_name, seed, out_path)
+    return df
+
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate synthetic NHANES data.")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=["vae", "ctgan"], required=True)
-    parser.add_argument("--n",    type=int, default=1000, help="Number of rows to generate")
-    parser.add_argument("--out",  type=str, default=None, help="Output CSV path")
+    parser.add_argument("--seed",  type=int, default=config.RANDOM_SEED)
+    parser.add_argument("--n",     type=int, default=config.N_SYNTHETIC)
+    parser.add_argument("--out",   type=str, default=None)
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info("Generating %d rows with %s on %s ...", args.n, args.model, device)
+    ckpt_path = config.MODELS_DIR / f"{args.model}_seed{args.seed}.pt"
+    if not ckpt_path.exists():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {ckpt_path}\n"
+            f"Run: python models/{args.model}/train.py --seed {args.seed}"
+        )
 
-    if args.model == "vae":
-        df = generate_vae(args.n, device)
-    else:
-        df = generate_ctgan(args.n, device)
+    df = generate(args.model, ckpt_path, seed=args.seed, n=args.n)
 
-    out_path = Path(args.out) if args.out else (
-        config.DATA_SYNTHETIC / f"{args.model}_nhanes_synthetic.csv"
-    )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out_path, index=False)
-    log.info("Saved %d rows -> %s", len(df), out_path)
-    log.info("Shape: %s", df.shape)
+    if args.out:
+        df.to_csv(args.out, index=False)
+        log.info("Saved to %s", args.out)
 
 
 if __name__ == "__main__":

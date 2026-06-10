@@ -1,10 +1,11 @@
 """
-models/vae/model.py — Variational Autoencoder for tabular health data.
+models/vae/model.py — VAE with column-type-aware decoder output.
 
 Architecture:
-  Encoder: FC layers -> (mu, logvar)
-  Reparameterisation trick: z = mu + sigma * eps
-  Decoder: FC layers -> reconstructed feature vector
+  Encoder: FC + BatchNorm1d + LeakyReLU -> (mu, logvar)
+  Decoder: FC + BatchNorm1d + LeakyReLU -> per-column activation:
+           - sigmoid for binary columns (only 0/1 after scaling)
+           - clamp(x, 0, 1) for continuous columns (avoids sigmoid saturation)
 """
 
 import torch
@@ -13,14 +14,14 @@ from typing import List, Tuple
 
 
 class Encoder(nn.Module):
-    """Fully-connected encoder producing (mu, logvar) for reparameterisation."""
+    """Fully-connected encoder with BatchNorm, producing (mu, logvar)."""
 
     def __init__(self, input_dim: int, hidden_dims: List[int], latent_dim: int) -> None:
         super().__init__()
         layers: List[nn.Module] = []
         prev = input_dim
         for h in hidden_dims:
-            layers += [nn.Linear(prev, h), nn.ReLU()]
+            layers += [nn.Linear(prev, h), nn.BatchNorm1d(h), nn.LeakyReLU(0.2)]
             prev = h
         self.net    = nn.Sequential(*layers)
         self.mu     = nn.Linear(prev, latent_dim)
@@ -32,38 +33,64 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    """Fully-connected decoder reconstructing the feature vector."""
+    """
+    Fully-connected decoder with column-type-aware output activation.
 
-    def __init__(self, latent_dim: int, hidden_dims: List[int], output_dim: int) -> None:
+    Binary columns receive sigmoid (output in [0,1] via saturation).
+    Continuous columns receive clamp(x, 0, 1) — linear in the valid range,
+    avoiding sigmoid's saturation artefacts on wide-range features.
+    """
+
+    def __init__(self, latent_dim: int, hidden_dims: List[int],
+                 output_dim: int, binary_col_indices: List[int]) -> None:
         super().__init__()
         layers: List[nn.Module] = []
         prev = latent_dim
         for h in reversed(hidden_dims):
-            layers += [nn.Linear(prev, h), nn.ReLU()]
+            layers += [nn.Linear(prev, h), nn.BatchNorm1d(h), nn.LeakyReLU(0.2)]
             prev = h
-        layers += [nn.Linear(prev, output_dim), nn.Sigmoid()]  # outputs in [0,1]
         self.net = nn.Sequential(*layers)
+        self.out_layer = nn.Linear(prev, output_dim)
+        self.binary_idx = set(binary_col_indices)
+        self.output_dim = output_dim
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return self.net(z)
+        h = self.out_layer(self.net(z))
+        # Per-column activation: sigmoid for binary, clamp for continuous
+        parts = []
+        for i in range(self.output_dim):
+            if i in self.binary_idx:
+                parts.append(torch.sigmoid(h[:, i : i + 1]))
+            else:
+                parts.append(torch.clamp(h[:, i : i + 1], 0.0, 1.0))
+        return torch.cat(parts, dim=1)
 
 
 class VAE(nn.Module):
     """Variational Autoencoder combining Encoder and Decoder."""
 
-    def __init__(self, input_dim: int, hidden_dims: List[int], latent_dim: int) -> None:
+    def __init__(self, input_dim: int, binary_col_indices: List[int],
+                 hidden_dims: List[int] = None, latent_dim: int = None) -> None:
         super().__init__()
+        # Import here to avoid circular deps when model is used standalone
+        import sys
+        from pathlib import Path
+        _root = Path(__file__).resolve().parents[2]
+        sys.path.insert(0, str(_root))
+        import config as _cfg
+        hidden_dims = hidden_dims if hidden_dims is not None else _cfg.VAE_HIDDEN_DIMS
+        latent_dim  = latent_dim  if latent_dim  is not None else _cfg.VAE_LATENT_DIM
+
         self.encoder = Encoder(input_dim, hidden_dims, latent_dim)
-        self.decoder = Decoder(latent_dim, hidden_dims, input_dim)
+        self.decoder = Decoder(latent_dim, hidden_dims, input_dim, binary_col_indices)
         self.latent_dim = latent_dim
 
     def reparameterise(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """Sample z = mu + sigma * eps; eps ~ N(0, I)."""
+        """Sample z = mu + sigma * eps, eps ~ N(0, I)."""
         if self.training:
             std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            return mu + eps * std
-        return mu  # deterministic at inference
+            return mu + std * torch.randn_like(std)
+        return mu
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         mu, logvar = self.encoder(x)
@@ -72,10 +99,16 @@ class VAE(nn.Module):
         return recon, mu, logvar
 
     @torch.no_grad()
-    def sample(self, n: int, device: torch.device) -> torch.Tensor:
-        """Sample n rows from the prior N(0, I)."""
+    def generate(self, n: int, device: torch.device) -> torch.Tensor:
+        """Sample n rows from prior N(0, I)."""
+        self.eval()
         z = torch.randn(n, self.latent_dim, device=device)
         return self.decoder(z)
+
+    @torch.no_grad()
+    def sample(self, n: int, device: torch.device) -> torch.Tensor:
+        """Alias for generate() — backwards compatibility."""
+        return self.generate(n, device)
 
 
 def vae_loss(
@@ -85,7 +118,7 @@ def vae_loss(
     logvar: torch.Tensor,
     kl_weight: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """MSE reconstruction loss + KL divergence (with optional annealing weight)."""
+    """MSE reconstruction loss + KL divergence with annealing weight."""
     recon_loss = nn.functional.mse_loss(recon, x, reduction="mean")
     kl_loss    = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
     total      = recon_loss + kl_weight * kl_loss

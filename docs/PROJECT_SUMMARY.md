@@ -25,12 +25,12 @@ KS test results, TSTR/TRTR utility ratio, DCR + MIA privacy scores
 ## Build Order (Logical Sequence)
 
 1. **Configuration** — `config.py` written first to anchor all paths and hyperparameters.
-2. **Preprocessing** — `preprocess.py` developed against raw NHANES XPT files; five critical bugs discovered and fixed (see `GAN/Data Prep..md`). Outputs `nhanes_clean.csv`, `scaler.pkl`, `splits.pkl`.
+2. **Preprocessing** — `preprocess.py` developed against raw NHANES XPT files; five critical bugs discovered and fixed (see `DATA_PREP.md`). Outputs `nhanes_clean.csv`, `scaler.pkl`, `splits.pkl`.
 3. **VAE model + training** — `models/vae/model.py` and `train.py` implemented with KL annealing.
 4. **CTGAN model + training** — `models/ctgan/model.py` and `train.py` implemented with WGAN-GP.
 5. **Generation script** — `generate.py` written to load either checkpoint and produce synthetic CSV.
 6. **Evaluation suite** — `evaluation/statistical.py`, `utility.py`, `privacy.py` implemented as standalone scripts.
-7. **Documentation** — `CLAUDE.md`, `ReadMe.md`, `Project Plan.md`, `GAN/Data Prep..md` written throughout.
+7. **Documentation** — `CLAUDE.md`, `README.md`, `PROJECT_PLAN.md`, `DATA_PREP.md` written throughout.
 
 ---
 
@@ -41,9 +41,9 @@ KS test results, TSTR/TRTR utility ratio, DCR + MIA privacy scores
 | File | What it does |
 |------|--------------|
 | `CLAUDE.md` | Master architecture reference: datasets, preprocessing steps, model designs, evaluation framework, hyperparameters, run commands, success metrics, known pitfalls. The authoritative spec for the whole project. |
-| `ReadMe.md` | High-level overview and quick-start commands for a new reader. |
-| `Project Plan.md` | Phased task breakdown (Phase 1–6) used to track implementation progress. |
-| `GAN/Data Prep..md` | Documents five critical bugs found during NHANES preprocessing and the exact fix applied for each. Essential reading before touching `preprocess.py`. |
+| `README.md` | High-level overview and quick-start commands for a new reader. |
+| `PROJECT_PLAN.md` | Phased task breakdown (Phase 1–6) used to track implementation progress. |
+| `DATA_PREP.md` | Documents five critical bugs found during NHANES preprocessing and the exact fix applied for each. Essential reading before touching `preprocess.py`. |
 
 ### Configuration and Dependencies
 
@@ -129,7 +129,7 @@ All six files are NHANES Cycle P (2017–2020 pre-pandemic), publicly available 
 
 ## Five Preprocessing Bugs Fixed
 
-All five are documented in detail in [GAN/Data Prep..md](GAN/Data%20Prep..md) and fixed in `preprocess.py`.
+All five are documented in detail in [DATA_PREP.md](DATA_PREP.md) and fixed in `preprocess.py`.
 
 1. **DPQ value 3 capped to 2** — raw PHQ-9 items have four response options (0–3); an early remap truncated 3→2, losing severity information. Fix: preserve 0–3 as-is.
 2. **MCQ binary coding** — NHANES codes "Yes" as 1 and "No" as 2 (not 0). Fix: remap 2→0 before training.

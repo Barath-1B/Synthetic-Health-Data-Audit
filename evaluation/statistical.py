@@ -1,12 +1,11 @@
 """
-evaluation/statistical.py — Statistical fidelity of synthetic vs real data.
+evaluation/statistical.py — Axis 1: Statistical fidelity (KS tests + clinical signals).
 
-Runs:
-  - Per-column KS test (real vs synthetic)
-  - Pearson correlation matrix comparison (side-by-side heatmap)
-  - Overlaid histogram for each feature
+Functional API (used by four_axis_audit.py):
+  axis1_ks(real, synthetic, seed) -> float (pass rate)
+  clinical_signal_check(real, synthetic) -> dict
 
-Usage:
+CLI usage (backwards compat):
   python evaluation/statistical.py --model vae
   python evaluation/statistical.py --model ctgan
 """
@@ -15,13 +14,16 @@ import argparse
 import logging
 import pickle
 import sys
+import warnings
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")   # non-interactive backend — avoids tkinter threading errors
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from scipy.stats import ks_2samp
+from scipy.stats import ks_2samp, spearmanr
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -31,8 +33,94 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
 
 
-def load_data(model: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load real test split and synthetic CSV."""
+def axis1_ks(real: pd.DataFrame, synthetic: pd.DataFrame, seed: int = 42) -> float:
+    """
+    Run two-sample KS test on every feature column.
+
+    Returns fraction of columns where p >= 0.05 (KS pass rate).
+    Saves failing-column histograms and correlation heatmaps to EVAL_PLOTS_DIR.
+    """
+    feature_cols = [c for c in real.columns if c != config.TARGET_COL]
+    results: dict[str, dict] = {}
+    for col in feature_cols:
+        r = np.round(real[col].dropna().values.astype(float), 10)
+        s = np.round(synthetic[col].dropna().values.astype(float), 10)
+        stat, p = ks_2samp(r, s)
+        results[col] = {"statistic": stat, "p_value": p, "pass": p >= 0.05}
+
+    df_ks = pd.DataFrame(results).T
+    pass_rate = float(df_ks["pass"].mean())
+
+    # Overlay histograms for failing columns
+    failing = df_ks[~df_ks["pass"]].index.tolist()
+    if failing:
+        n_show = min(len(failing), 6)
+        fig, axes = plt.subplots(n_show, 1, figsize=(8, 3 * n_show))
+        if n_show == 1:
+            axes = [axes]
+        for ax, col in zip(axes, failing[:n_show]):
+            ax.hist(real[col], alpha=0.5, bins=30, label="Real", density=True)
+            ax.hist(synthetic[col], alpha=0.5, bins=30, label="Synthetic", density=True)
+            ax.set_title(f"{col}  (p={results[col]['p_value']:.4f})")
+            ax.legend()
+        plt.tight_layout()
+        plt.savefig(config.EVAL_PLOTS_DIR / f"ks_failing_cols_seed{seed}.png", dpi=150)
+        plt.close()
+
+    # Correlation heatmaps
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    sns.heatmap(real[feature_cols].corr(), ax=ax1, cmap="coolwarm", center=0, vmin=-1, vmax=1)
+    ax1.set_title("Real data correlations")
+    sns.heatmap(synthetic[feature_cols].corr(), ax=ax2, cmap="coolwarm", center=0, vmin=-1, vmax=1)
+    ax2.set_title("Synthetic data correlations")
+    plt.tight_layout()
+    plt.savefig(config.EVAL_PLOTS_DIR / f"correlation_heatmap_seed{seed}.png", dpi=150)
+    plt.close()
+
+    log.info("  KS: %d/%d columns pass (p≥0.05). Pass rate: %.3f",
+             int(df_ks["pass"].sum()), len(df_ks), pass_rate)
+    return pass_rate
+
+
+def clinical_signal_check(real: pd.DataFrame, synthetic: pd.DataFrame) -> dict:
+    """
+    Verify that known clinical correlations from literature are preserved.
+
+    Any Spearman correlation that diverges > 0.15 from the real data is flagged.
+    Uses renamed column names (post-preprocessing).
+    """
+    warnings.filterwarnings("ignore")
+    # (feature_col, target_col, expected_direction)
+    PAIRS = [
+        ("Age",                 config.TARGET_COL, "positive"),
+        ("Sleep_Hours_Weekday", config.TARGET_COL, "negative"),
+        ("Avg_Drinks_Per_Day",  config.TARGET_COL, "positive"),
+    ]
+    results: dict[str, dict] = {}
+    for col_a, col_b, _ in PAIRS:
+        if col_a not in real.columns or col_b not in real.columns:
+            continue
+        r_real, _ = spearmanr(real[col_a], real[col_b])
+        r_syn, _  = spearmanr(synthetic[col_a], synthetic[col_b])
+        divergence = abs(r_real - r_syn)
+        flagged = divergence > 0.15
+        key = f"{col_a}_vs_{col_b}"
+        results[key] = {
+            "real_spearman": float(r_real),
+            "syn_spearman":  float(r_syn),
+            "divergence":    float(divergence),
+            "flagged":       flagged,
+        }
+        status = "FLAGGED" if flagged else "OK"
+        log.info("  Clinical: %s vs %s: real=%.3f syn=%.3f gap=%.3f %s",
+                 col_a, col_b, r_real, r_syn, divergence, status)
+    return results
+
+
+# ── Legacy CLI helpers ────────────────────────────────────────────────────────
+
+def _load_data(model: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load real test split and synthetic CSV; return both in [0,1] scale."""
     real_df = pd.read_csv(config.NHANES_CLEAN)
     with open(config.SPLITS_PATH, "rb") as f:
         splits = pickle.load(f)
@@ -45,54 +133,14 @@ def load_data(model: str) -> tuple[pd.DataFrame, pd.DataFrame]:
             f"Run: python generate.py --model {model} --n 1000"
         )
     synth_df = pd.read_csv(synth_path)
+
+    with open(config.SCALER_PATH, "rb") as f:
+        bundle = pickle.load(f)
+    scaler = bundle["scaler"]
+    feature_cols = bundle["feature_cols"]
+    shared = [c for c in feature_cols if c in synth_df.columns]
+    synth_df[shared] = scaler.transform(synth_df[shared])
     return real_test, synth_df
-
-
-def ks_tests(real: pd.DataFrame, synth: pd.DataFrame) -> pd.DataFrame:
-    """Run KS test on each shared column; flag failures (p < 0.05)."""
-    shared = [c for c in real.columns if c in synth.columns]
-    rows = []
-    for col in shared:
-        stat, p = ks_2samp(real[col].dropna(), synth[col].dropna())
-        rows.append({"column": col, "ks_stat": round(stat, 4),
-                     "p_value": round(p, 4), "pass": p >= 0.05})
-    return pd.DataFrame(rows)
-
-
-def correlation_heatmap(real: pd.DataFrame, synth: pd.DataFrame, plots_dir: Path) -> None:
-    """Side-by-side Pearson correlation heatmaps."""
-    shared = [c for c in real.columns if c in synth.columns]
-    corr_r = real[shared].corr()
-    corr_s = synth[shared].corr()
-
-    fig, axes = plt.subplots(1, 2, figsize=(20, 9))
-    kw = dict(cmap="coolwarm", vmin=-1, vmax=1, square=True, linewidths=0.3, annot=False)
-    sns.heatmap(corr_r, ax=axes[0], **kw)
-    axes[0].set_title("Real data — correlation matrix")
-    sns.heatmap(corr_s, ax=axes[1], **kw)
-    axes[1].set_title("Synthetic data — correlation matrix")
-
-    out = plots_dir / "correlation.png"
-    plt.tight_layout()
-    plt.savefig(out, dpi=150)
-    plt.close()
-    log.info("Saved correlation heatmap -> %s", out)
-
-
-def overlaid_histograms(real: pd.DataFrame, synth: pd.DataFrame, plots_dir: Path) -> None:
-    """Overlaid histogram for each feature."""
-    shared = [c for c in real.columns if c in synth.columns]
-    for col in shared:
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.hist(real[col].dropna(),  bins=30, alpha=0.5, label="Real",      density=True)
-        ax.hist(synth[col].dropna(), bins=30, alpha=0.5, label="Synthetic", density=True)
-        ax.set_title(col)
-        ax.legend()
-        out = plots_dir / f"hist_{col}.png"
-        plt.tight_layout()
-        plt.savefig(out, dpi=100)
-        plt.close()
-    log.info("Saved %d histograms -> %s", len(shared), plots_dir)
 
 
 def main() -> None:
@@ -100,25 +148,14 @@ def main() -> None:
     parser.add_argument("--model", choices=["vae", "ctgan"], required=True)
     args = parser.parse_args()
 
-    config.EVAL_PLOTS_DIR.mkdir(parents=True, exist_ok=True)
-
-    real, synth = load_data(args.model)
+    real, synth = _load_data(args.model)
     log.info("Real test: %s  |  Synthetic: %s", real.shape, synth.shape)
 
-    # KS tests
-    ks_df = ks_tests(real, synth)
-    n_pass = ks_df["pass"].sum()
-    n_total = len(ks_df)
-    log.info("\nKS test results (%d/%d columns pass p>=0.05):", n_pass, n_total)
-    log.info(ks_df.to_string(index=False))
+    pass_rate = axis1_ks(real, synth, seed=config.RANDOM_SEED)
+    log.info("KS pass rate: %.3f", pass_rate)
 
-    out_csv = config.EVAL_PLOTS_DIR / f"ks_results_{args.model}.csv"
-    ks_df.to_csv(out_csv, index=False)
-    log.info("Saved KS results -> %s", out_csv)
-
-    # Plots
-    correlation_heatmap(real, synth, config.EVAL_PLOTS_DIR)
-    overlaid_histograms(real, synth, config.EVAL_PLOTS_DIR)
+    log.info("\nClinical signal check:")
+    clinical_signal_check(real, synth)
 
 
 if __name__ == "__main__":

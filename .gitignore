@@ -22,7 +22,6 @@ env/
 # AI/Claude instructions (not part of the project code)
 CLAUDE.md
 claude.md
-GAN/Data Prep..md
 
 # Word documents (not code)
 *.docx
@@ -52,3 +51,27 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Session / temp files
+SESSION.md
+dashboard.html
+grfzhhncsfqn.pdf
+logs/
+ppt_images/
+
+# AI prompt docs
+docs/@dashboard_prompt.md
+docs/dashboard_build.md
+docs/dashboard_methodology.md
+docs/REPORT.md
+docs/RESULTS.md
+docs/section 2/
+
+# Paper notes (internal)
+paper/
+
+# Binary evaluation artifacts
+evaluation/results/*.npy
+
+# Generated evaluation CSVs (reproducible)
+evaluation/results/
