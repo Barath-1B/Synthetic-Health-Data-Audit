@@ -46,3 +46,32 @@ def print_table(summaries: dict[str, pd.DataFrame]) -> None:
             r = df[df["metric"] == metric].iloc[0]
             row += f"  {r['mean']:.4f} ± {r['std']:.4f}  "
         print(row)
+
+
+def print_significance(per_seed: dict[str, list[dict]],
+                       metrics: list[str]) -> None:
+    """
+    Pairwise Wilcoxon signed-rank tests across seeds for the given metrics.
+
+    With only len(SEEDS)=5 paired samples the test is low-powered (smallest
+    achievable two-sided p is 0.0625); p-values are reported descriptively,
+    not as a pass/fail gate.
+    """
+    from itertools import combinations
+    from scipy.stats import wilcoxon
+
+    models = list(per_seed.keys())
+    print(f"\n{'Pairwise Wilcoxon (across seeds)':<40}")
+    for metric in metrics:
+        print(f"\n  {metric}:")
+        for m1, m2 in combinations(models, 2):
+            v1 = np.array([r[metric] for r in per_seed[m1]], dtype=float)
+            v2 = np.array([r[metric] for r in per_seed[m2]], dtype=float)
+            if len(v1) != len(v2) or len(v1) < 3 or np.allclose(v1, v2):
+                continue
+            try:
+                stat, p = wilcoxon(v1, v2)
+                print(f"    {m1} vs {m2}: diff={v1.mean() - v2.mean():+.4f}  "
+                      f"p={p:.4f}")
+            except ValueError:
+                continue

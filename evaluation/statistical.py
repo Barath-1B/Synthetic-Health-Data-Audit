@@ -1,18 +1,28 @@
 """
-evaluation/statistical.py — Axis 1: Statistical fidelity (KS tests + clinical signals).
+evaluation/statistical.py — Axis 1: Statistical fidelity (effect sizes + clinical signals).
+
+Axis 1 score = mean over feature columns of:
+  - continuous columns:  KSComplement = 1 - KS statistic D   (SDMetrics convention)
+  - categorical columns: 1 - Total Variation Distance (TVD)
+
+Gate: fidelity_score >= FAA_FIDELITY_SCORE (0.90).
+
+Why effect sizes, not p-values: a two-sample KS p-value gate at these sample
+sizes (~6,275 real vs 1,000 synthetic) rejects on trivially small deviations —
+its power grows with n, so the old "fraction of columns with p >= 0.05" gate
+fails by construction for any imperfect generator. Raw p-values are still
+recorded per column as supplementary output.
 
 Functional API (used by four_axis_audit.py):
-  axis1_ks(real, synthetic, seed) -> float (pass rate)
+  axis1_fidelity(real, synthetic, seed, model_name) -> (score, per_col_df)
   clinical_signal_check(real, synthetic) -> dict
 
-CLI usage (backwards compat):
-  python evaluation/statistical.py --model vae
-  python evaluation/statistical.py --model ctgan
+CLI:
+  python evaluation/statistical.py --model vae --seed 42
 """
 
 import argparse
 import logging
-import pickle
 import sys
 import warnings
 from pathlib import Path
@@ -33,38 +43,56 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
 
 
-def axis1_ks(real: pd.DataFrame, synthetic: pd.DataFrame, seed: int = 42) -> float:
-    """
-    Run two-sample KS test on every feature column.
+def _tvd(real_vals: np.ndarray, syn_vals: np.ndarray) -> float:
+    """Total Variation Distance between two empirical categorical distributions."""
+    levels = np.union1d(np.unique(real_vals), np.unique(syn_vals))
+    p = np.array([(real_vals == lv).mean() for lv in levels])
+    q = np.array([(syn_vals == lv).mean() for lv in levels])
+    return 0.5 * float(np.abs(p - q).sum())
 
-    Returns fraction of columns where p >= 0.05 (KS pass rate).
-    Saves failing-column histograms and correlation heatmaps to EVAL_PLOTS_DIR.
+
+def axis1_fidelity(real: pd.DataFrame, synthetic: pd.DataFrame,
+                   seed: int = 42, model_name: str = "unknown"
+                   ) -> tuple[float, pd.DataFrame]:
+    """
+    Per-column marginal fidelity via effect sizes.
+
+    Returns:
+        (fidelity_score, per_col_df) — score is the mean per-column fidelity;
+        per_col_df has columns [column, kind, fidelity, ks_stat, ks_pvalue].
+    Saves lowest-fidelity histograms and correlation heatmaps to EVAL_PLOTS_DIR.
     """
     feature_cols = [c for c in real.columns if c != config.TARGET_COL]
-    results: dict[str, dict] = {}
+    rows: list[dict] = []
     for col in feature_cols:
         r = np.round(real[col].dropna().values.astype(float), 10)
         s = np.round(synthetic[col].dropna().values.astype(float), 10)
         stat, p = ks_2samp(r, s)
-        results[col] = {"statistic": stat, "p_value": p, "pass": p >= 0.05}
+        if col in config.CONTINUOUS_COLS:
+            kind, fid = "continuous", 1.0 - float(stat)      # KSComplement
+        else:
+            kind, fid = "categorical", 1.0 - _tvd(r, s)      # 1 - TVD
+        rows.append({"column": col, "kind": kind, "fidelity": fid,
+                     "ks_stat": float(stat), "ks_pvalue": float(p)})
 
-    df_ks = pd.DataFrame(results).T
-    pass_rate = float(df_ks["pass"].mean())
+    per_col = pd.DataFrame(rows)
+    score = float(per_col["fidelity"].mean())
 
-    # Overlay histograms for failing columns
-    failing = df_ks[~df_ks["pass"]].index.tolist()
-    if failing:
-        n_show = min(len(failing), 6)
-        fig, axes = plt.subplots(n_show, 1, figsize=(8, 3 * n_show))
-        if n_show == 1:
+    # Overlay histograms for the lowest-fidelity columns
+    worst = per_col.nsmallest(min(6, len(per_col)), "fidelity")["column"].tolist()
+    if worst:
+        fig, axes = plt.subplots(len(worst), 1, figsize=(8, 3 * len(worst)))
+        if len(worst) == 1:
             axes = [axes]
-        for ax, col in zip(axes, failing[:n_show]):
+        for ax, col in zip(axes, worst):
+            fid = per_col.loc[per_col["column"] == col, "fidelity"].iloc[0]
             ax.hist(real[col], alpha=0.5, bins=30, label="Real", density=True)
             ax.hist(synthetic[col], alpha=0.5, bins=30, label="Synthetic", density=True)
-            ax.set_title(f"{col}  (p={results[col]['p_value']:.4f})")
+            ax.set_title(f"{col}  (fidelity={fid:.3f})")
             ax.legend()
         plt.tight_layout()
-        plt.savefig(config.EVAL_PLOTS_DIR / f"ks_failing_cols_seed{seed}.png", dpi=150)
+        plt.savefig(config.EVAL_PLOTS_DIR /
+                    f"fidelity_worst_cols_{model_name}_seed{seed}.png", dpi=150)
         plt.close()
 
     # Correlation heatmaps
@@ -74,12 +102,13 @@ def axis1_ks(real: pd.DataFrame, synthetic: pd.DataFrame, seed: int = 42) -> flo
     sns.heatmap(synthetic[feature_cols].corr(), ax=ax2, cmap="coolwarm", center=0, vmin=-1, vmax=1)
     ax2.set_title("Synthetic data correlations")
     plt.tight_layout()
-    plt.savefig(config.EVAL_PLOTS_DIR / f"correlation_heatmap_seed{seed}.png", dpi=150)
+    plt.savefig(config.EVAL_PLOTS_DIR /
+                f"correlation_heatmap_{model_name}_seed{seed}.png", dpi=150)
     plt.close()
 
-    log.info("  KS: %d/%d columns pass (p≥0.05). Pass rate: %.3f",
-             int(df_ks["pass"].sum()), len(df_ks), pass_rate)
-    return pass_rate
+    log.info("  Fidelity score: %.3f (mean of %d columns)  [target >= %.2f]",
+             score, len(per_col), config.FAA_FIDELITY_SCORE)
+    return score, per_col
 
 
 def clinical_signal_check(real: pd.DataFrame, synthetic: pd.DataFrame) -> dict:
@@ -117,45 +146,28 @@ def clinical_signal_check(real: pd.DataFrame, synthetic: pd.DataFrame) -> dict:
     return results
 
 
-# ── Legacy CLI helpers ────────────────────────────────────────────────────────
-
-def _load_data(model: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load real test split and synthetic CSV; return both in [0,1] scale."""
-    real_df = pd.read_csv(config.NHANES_CLEAN)
-    with open(config.SPLITS_PATH, "rb") as f:
-        splits = pickle.load(f)
-    real_test = real_df.iloc[splits["test"]].reset_index(drop=True)
-
-    synth_path = config.DATA_SYNTHETIC / f"{model}_nhanes_synthetic.csv"
-    if not synth_path.exists():
-        raise FileNotFoundError(
-            f"Synthetic file not found: {synth_path}\n"
-            f"Run: python generate.py --model {model} --n 1000"
-        )
-    synth_df = pd.read_csv(synth_path)
-
-    with open(config.SCALER_PATH, "rb") as f:
-        bundle = pickle.load(f)
-    scaler = bundle["scaler"]
-    feature_cols = bundle["feature_cols"]
-    shared = [c for c in feature_cols if c in synth_df.columns]
-    synth_df[shared] = scaler.transform(synth_df[shared])
-    return real_test, synth_df
-
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=["vae", "ctgan"], required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--seed", type=int, default=config.RANDOM_SEED)
     args = parser.parse_args()
 
-    real, synth = _load_data(args.model)
-    log.info("Real test: %s  |  Synthetic: %s", real.shape, synth.shape)
+    real_train = pd.read_csv(config.NHANES_TRAIN)
+    synth_path = config.DATA_SYNTHETIC / f"{args.model}_synthetic_seed{args.seed}.csv"
+    if not synth_path.exists():
+        raise FileNotFoundError(f"Synthetic file not found: {synth_path}")
+    synth_df = pd.read_csv(synth_path)
 
-    pass_rate = axis1_ks(real, synth, seed=config.RANDOM_SEED)
-    log.info("KS pass rate: %.3f", pass_rate)
+    score, per_col = axis1_fidelity(real_train, synth_df,
+                                    seed=args.seed, model_name=args.model)
+    log.info("Fidelity score: %.3f", score)
+    log.info("\nPer-column fidelity:\n%s",
+             per_col.sort_values("fidelity").to_string(index=False))
 
     log.info("\nClinical signal check:")
-    clinical_signal_check(real, synth)
+    clinical_signal_check(real_train, synth_df)
 
 
 if __name__ == "__main__":

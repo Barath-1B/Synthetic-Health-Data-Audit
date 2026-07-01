@@ -65,9 +65,18 @@ def train_vae(seed: int = config.RANDOM_SEED) -> Path:
     val_df   = pd.read_csv(config.NHANES_VAL)
 
     feature_cols = [c for c in train_df.columns if c != config.TARGET_COL]
-    X_train = train_df[feature_cols].values.astype(np.float32)
-    X_val   = val_df[feature_cols].values.astype(np.float32)
-    log.info("Input dim: %d  |  Train: %d  Val: %d", X_train.shape[1], len(X_train), len(X_val))
+
+    def _matrix(df: pd.DataFrame) -> np.ndarray:
+        """Features + scaled target as the last column (joint label generation)."""
+        feats  = df[feature_cols].values.astype(np.float32)
+        target = (df[config.TARGET_COL].values.astype(np.float32)
+                  / (config.NUM_CLASSES - 1)).reshape(-1, 1)
+        return np.hstack([feats, target])
+
+    X_train = _matrix(train_df)
+    X_val   = _matrix(val_df)
+    log.info("Input dim: %d (features + joint target)  |  Train: %d  Val: %d",
+             X_train.shape[1], len(X_train), len(X_val))
 
     binary_idx = get_binary_col_indices(train_df, config.TARGET_COL)
     log.info("Binary columns: %d / %d", len(binary_idx), len(feature_cols))
@@ -128,6 +137,7 @@ def train_vae(seed: int = config.RANDOM_SEED) -> Path:
                 "input_dim": X_train.shape[1],
                 "binary_col_indices": binary_idx,
                 "feature_cols": feature_cols,
+                "joint_target": True,
                 "seed": seed,
             }, ckpt_path)
 

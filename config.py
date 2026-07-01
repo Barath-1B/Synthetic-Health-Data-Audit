@@ -42,10 +42,12 @@ CONTINUOUS_COLS = [
 ]
 
 # ── Four-Axis Audit thresholds ───────────────────────────────────────────────
-FAA_KS_PASS_RATE    = 0.80   # axis 1: fraction of columns with KS p >= 0.05
-FAA_UTILITY_RATIO   = 0.85   # axis 2: TSTR/TRTR AUC ratio
-FAA_DCR_MEAN        = 0.10   # axis 3: mean distance-to-closest-record
-FAA_MIA_ACCURACY    = 0.55   # axis 4: shadow-model MIA accuracy (must be <=)
+FAA_FIDELITY_SCORE  = 0.90   # axis 1: mean per-column effect-size fidelity
+                             #         (KSComplement / 1-TVD, SDMetrics convention)
+FAA_UTILITY_RATIO   = 0.85   # axis 2: TSTR/TRTR AUC ratio (RandomForest)
+FAA_DCR_RATIO       = 1.00   # axis 3: DCR(syn->train) / DCR(test->train);
+                             #         synthetic must be no closer than holdout
+FAA_MIA_AUC         = 0.55   # axis 4: DOMIAS density-ratio attack ROC AUC (<=)
 
 # ── VAE ──────────────────────────────────────────────────────────────────────
 VAE_LATENT_DIM       = 64

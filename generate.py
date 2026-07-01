@@ -1,5 +1,5 @@
 """
-generate.py — Generate synthetic NHANES rows from a trained VAE, CTGAN, or TVAE.
+generate.py — Generate synthetic NHANES rows from a trained VAE or CTGAN.
 
 Called by run_all_seeds.py:
   generate(model_name, checkpoint_path, seed) -> pd.DataFrame
@@ -7,6 +7,21 @@ Called by run_all_seeds.py:
 CLI usage:
   python generate.py --model vae   --seed 42 --n 1000
   python generate.py --model ctgan --seed 42 --n 1000
+  python generate.py --model vae   --seed 42 --marginal-correction   # ablation only
+
+Post-processing applied to every model:
+  1. Categorical/binary columns are snapped to the nearest valid scaled level
+     observed in the real training data (generators emit continuous values).
+  2. Optionally (ablation only, --marginal-correction) continuous marginals are
+     rank-remapped onto the real training CDF. This copies real training floats
+     into the synthetic data, so it is DISABLED by default and reported as a
+     metric-gaming ablation in the paper, never as the main configuration.
+
+Label (Depression_Severity) mechanisms:
+  - VAE:   generated jointly as an extra scaled column (trained with the target
+           appended to the feature matrix), then snapped to {0..4}.
+  - CTGAN: class labels sampled from the real training distribution, fed as the
+           one-hot condition, and used directly as the label.
 """
 
 import argparse
@@ -39,18 +54,45 @@ def _load_real_train() -> pd.DataFrame:
     return pd.read_csv(config.NHANES_TRAIN)
 
 
-def _correct_marginals(df: pd.DataFrame, cont_cols: list[str],
-                        real_train: pd.DataFrame) -> pd.DataFrame:
+def _discretize_categoricals(df: pd.DataFrame, cat_cols: list[str],
+                             real_train: pd.DataFrame) -> pd.DataFrame:
     """
-    Rank-based marginal correction in [0,1] space.
+    Snap each categorical/binary column to the nearest valid scaled level.
+
+    Generators emit continuous values for every column; real categorical
+    columns only take a small set of scaled levels (e.g. {0, 1} for binary,
+    {0, 0.25, ...} for multi-level). Without this step synthetic rows are
+    trivially distinguishable from real ones on every categorical column.
+    """
+    df = df.copy()
+    for col in cat_cols:
+        if col not in df.columns or col not in real_train.columns:
+            continue
+        levels = np.sort(real_train[col].unique()).astype(float)
+        vals = df[col].values.astype(float)
+        if len(levels) == 1:
+            df[col] = levels[0]
+            continue
+        idx = np.searchsorted(levels, vals).clip(1, len(levels) - 1)
+        left, right = levels[idx - 1], levels[idx]
+        df[col] = np.where(np.abs(vals - left) <= np.abs(right - vals), left, right)
+    return df
+
+
+def apply_marginal_correction(df: pd.DataFrame,
+                              real_train: pd.DataFrame) -> pd.DataFrame:
+    """
+    ABLATION ONLY — rank-based marginal correction in [0,1] space.
 
     For each continuous column, remaps synthetic values to the real training
-    CDF via index-based sampling so corrected values are exact floats from
-    nhanes_train.csv — avoids 1-ULP mismatches in ks_2samp.
+    CDF via index-based sampling, so corrected values are exact floats from
+    nhanes_train.csv. This guarantees marginal fidelity by construction
+    (metric gaming) and injects verbatim real values into the synthetic data.
+    Must be applied uniformly to all models when used, and disclosed.
     """
     df = df.copy()
     n = len(df)
-    for col in cont_cols:
+    for col in config.CONTINUOUS_COLS:
         if col not in df.columns or col not in real_train.columns:
             continue
         synth_vals  = df[col].values.astype(float)
@@ -63,34 +105,40 @@ def _correct_marginals(df: pd.DataFrame, cont_cols: list[str],
     return df
 
 
-def _assign_labels_vae(synthetic_df: pd.DataFrame,
-                        real_train: pd.DataFrame) -> pd.Series:
-    """
-    Predict Depression_Severity for VAE-generated rows using a RF classifier
-    trained on the real training set.  This ensures TSTR labels reflect the
-    generated feature values rather than a purely random class assignment.
-    """
-    from sklearn.ensemble import RandomForestClassifier
-    feat_cols = [c for c in real_train.columns if c != config.TARGET_COL]
-    clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
-    clf.fit(real_train[feat_cols].values, real_train[config.TARGET_COL].values)
-    preds = clf.predict(synthetic_df[feat_cols].values)
-    return pd.Series(preds, name=config.TARGET_COL)
+def _postprocess(df: pd.DataFrame, real_train: pd.DataFrame,
+                 marginal_correction: bool) -> pd.DataFrame:
+    """Shared post-processing: discretize categoricals, optional MC ablation."""
+    feature_cols = [c for c in real_train.columns if c != config.TARGET_COL]
+    cat_cols = [c for c in feature_cols if c not in config.CONTINUOUS_COLS]
+    df = _discretize_categoricals(df, cat_cols, real_train)
+    if marginal_correction:
+        log.warning("Marginal correction ENABLED (ablation mode) — synthetic "
+                    "continuous values are copies of real training floats.")
+        df = apply_marginal_correction(df, real_train)
+    return df
 
 
 def generate_vae(checkpoint_path: Path, n: int, seed: int,
-                 device: torch.device) -> pd.DataFrame:
+                 device: torch.device,
+                 marginal_correction: bool = False) -> pd.DataFrame:
     """
     Generate n rows using a trained VAE checkpoint.
 
-    Returns a DataFrame in [0,1] scaled space (same as nhanes_train.csv)
-    with Depression_Severity labels assigned by a RF classifier trained on
-    real training data.
+    The VAE is trained jointly on features + scaled target, so the label is
+    generated, not assigned post hoc. Returns a DataFrame in [0,1] scaled
+    space with an integer Depression_Severity column.
     """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     input_dim    = ckpt["input_dim"]
     binary_idx   = ckpt.get("binary_col_indices", [])
     feature_cols = ckpt.get("feature_cols", None)
+
+    if not ckpt.get("joint_target", False):
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path} predates joint-label training "
+            f"(no 'joint_target' flag). Retrain: python models/vae/train.py "
+            f"--seed {seed}"
+        )
 
     if feature_cols is None:
         train_df = pd.read_csv(config.NHANES_TRAIN)
@@ -105,31 +153,30 @@ def generate_vae(checkpoint_path: Path, n: int, seed: int,
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    _, cont_cols, _ = _load_scaler()
     real_train = _load_real_train()  # already in [0,1] space
 
     torch.manual_seed(seed)
     with torch.no_grad():
         raw = model.generate(n, device).cpu().numpy()
 
-    df = pd.DataFrame(raw, columns=feature_cols)
+    # Last column is the jointly-generated scaled target
+    df = pd.DataFrame(raw[:, :-1], columns=feature_cols)
+    label_scaled = np.clip(raw[:, -1], 0.0, 1.0)
+    labels = np.rint(label_scaled * (config.NUM_CLASSES - 1)).astype(int)
 
-    # Rank-based marginal correction stays in [0,1] space
-    df = _correct_marginals(df, cont_cols, real_train[feature_cols])
-
-    # Assign Depression_Severity using RF classifier trained in [0,1] feature space
-    df[config.TARGET_COL] = _assign_labels_vae(df, real_train).values
-
+    df = _postprocess(df, real_train, marginal_correction)
+    df[config.TARGET_COL] = labels
     return df
 
 
 def generate_ctgan(checkpoint_path: Path, n: int, seed: int,
-                   device: torch.device) -> pd.DataFrame:
+                   device: torch.device,
+                   marginal_correction: bool = False) -> pd.DataFrame:
     """
     Generate n rows using a trained CTGAN checkpoint.
 
-    Returns a DataFrame in [0,1] scaled space (same as nhanes_train.csv)
-    with Depression_Severity labels from the condition vector.
+    Returns a DataFrame in [0,1] scaled space with Depression_Severity taken
+    from the one-hot condition vector.
     """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     input_dim    = ckpt["input_dim"]
@@ -146,7 +193,6 @@ def generate_ctgan(checkpoint_path: Path, n: int, seed: int,
     gen.load_state_dict(ckpt["gen_state"])
     gen.eval()
 
-    _, cont_cols, _ = _load_scaler()
     real_train = _load_real_train()  # already in [0,1] space
 
     # Sample class labels proportional to real training distribution
@@ -162,18 +208,13 @@ def generate_ctgan(checkpoint_path: Path, n: int, seed: int,
         raw   = gen(noise, cond).cpu().numpy()
 
     df = pd.DataFrame(raw, columns=feature_cols)
-
-    # Rank-based marginal correction stays in [0,1] space
-    df = _correct_marginals(df, cont_cols, real_train[feature_cols])
-
-    # CTGAN: use condition labels directly as Depression_Severity
+    df = _postprocess(df, real_train, marginal_correction)
     df[config.TARGET_COL] = labels.astype(int)
-
     return df
 
 
 def generate(model_name: str, checkpoint_path: Path, seed: int = 42,
-             n: int = None) -> pd.DataFrame:
+             n: int = None, marginal_correction: bool = False) -> pd.DataFrame:
     """
     Unified generation interface called by run_all_seeds.py.
 
@@ -182,6 +223,7 @@ def generate(model_name: str, checkpoint_path: Path, seed: int = 42,
         checkpoint_path: Path to the model checkpoint
         seed: Random seed
         n: Number of rows to generate (defaults to config.N_SYNTHETIC)
+        marginal_correction: ablation flag — see apply_marginal_correction()
 
     Returns:
         DataFrame with feature columns + Depression_Severity
@@ -190,15 +232,17 @@ def generate(model_name: str, checkpoint_path: Path, seed: int = 42,
     device = torch.device(config.DEVICE)
 
     if model_name == "vae":
-        df = generate_vae(checkpoint_path, n, seed, device)
+        df = generate_vae(checkpoint_path, n, seed, device, marginal_correction)
     elif model_name == "ctgan":
-        df = generate_ctgan(checkpoint_path, n, seed, device)
+        df = generate_ctgan(checkpoint_path, n, seed, device, marginal_correction)
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
-    out_path = config.DATA_SYNTHETIC / f"{model_name}_synthetic_seed{seed}.csv"
+    suffix = "_mc" if marginal_correction else ""
+    out_path = config.DATA_SYNTHETIC / f"{model_name}_synthetic{suffix}_seed{seed}.csv"
     df.to_csv(out_path, index=False)
-    log.info("Generated %d rows (%s, seed=%d) -> %s", len(df), model_name, seed, out_path)
+    log.info("Generated %d rows (%s, seed=%d, mc=%s) -> %s",
+             len(df), model_name, seed, marginal_correction, out_path)
     return df
 
 
@@ -208,6 +252,9 @@ def main() -> None:
     parser.add_argument("--seed",  type=int, default=config.RANDOM_SEED)
     parser.add_argument("--n",     type=int, default=config.N_SYNTHETIC)
     parser.add_argument("--out",   type=str, default=None)
+    parser.add_argument("--marginal-correction", action="store_true",
+                        help="Ablation only: rank-remap continuous marginals "
+                             "onto the real training CDF (copies real values).")
     args = parser.parse_args()
 
     ckpt_path = config.MODELS_DIR / f"{args.model}_seed{args.seed}.pt"
@@ -217,7 +264,8 @@ def main() -> None:
             f"Run: python models/{args.model}/train.py --seed {args.seed}"
         )
 
-    df = generate(args.model, ckpt_path, seed=args.seed, n=args.n)
+    df = generate(args.model, ckpt_path, seed=args.seed, n=args.n,
+                  marginal_correction=args.marginal_correction)
 
     if args.out:
         df.to_csv(args.out, index=False)
