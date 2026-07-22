@@ -19,10 +19,6 @@ env/
 .ipynb_checkpoints/
 *.ipynb
 
-# AI/Claude instructions (not part of the project code)
-CLAUDE.md
-claude.md
-
 # Word documents (not code)
 *.docx
 
@@ -67,11 +63,7 @@ docs/REPORT.md
 docs/RESULTS.md
 docs/section 2/
 
-# Paper notes (internal)
-paper/
-
-# Binary evaluation artifacts
+# Binary evaluation artifacts (raw DCR distance arrays, ~2.9 MB, regenerable)
+# The compact evaluation/results/*.csv ARE tracked - they are the frozen audit numbers,
+# and so is paper/ (source + the three figures). See docs/AUDIT_2026-07-22.md.
 evaluation/results/*.npy
-
-# Generated evaluation CSVs (reproducible)
-evaluation/results/
