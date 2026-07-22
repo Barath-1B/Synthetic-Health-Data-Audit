@@ -1,5 +1,11 @@
 # PROJECT SUMMARY
 
+> # ⚠️ SUPERSEDED — DO NOT QUOTE NUMBERS FROM THIS FILE
+> Written against the pre-pivot pipeline. Any "DCR-MIA gap", "15/15 runs", shadow-MIA
+> accuracy, KS pass-rate, or absolute-DCR figure below is a retracted artifact of the old
+> Axis 4. Current numbers: the Known Results table in `/CLAUDE.md`. Claim status and reasons:
+> `/reference.md` §1 and §5.
+
 ## What This Project Does
 
 This project builds a pipeline that takes real mental health survey data (NHANES) and produces **privacy-safe synthetic tabular data** using two generative models: a Variational Autoencoder (VAE) and a Conditional Tabular GAN (CTGAN). The synthetic data is designed to statistically mirror the original while having no 1-to-1 correspondence with any real individual. The pipeline covers the full ML research cycle: raw data ingestion → preprocessing → model training → synthetic generation → three-dimensional evaluation (statistical fidelity, downstream utility, privacy resilience).

@@ -1,5 +1,11 @@
 # PROJECT_PLAN.md — Implementation Phases
 
+> # ⚠️ SUPERSEDED — DO NOT QUOTE NUMBERS FROM THIS FILE
+> Written against the pre-pivot pipeline. Any "DCR-MIA gap", "15/15 runs", shadow-MIA
+> accuracy, KS pass-rate, or absolute-DCR figure below is a retracted artifact of the old
+> Axis 4. Current numbers: the Known Results table in `/CLAUDE.md`. Claim status and reasons:
+> `/reference.md` §1 and §5.
+
 This file breaks the project into clear phases with specific tasks. Work through them in order. Each phase should be complete and tested before moving to the next.
 
 ---
