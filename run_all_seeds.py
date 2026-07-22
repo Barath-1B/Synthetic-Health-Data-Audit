@@ -12,7 +12,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from config import (SEEDS, MODELS_DIR, N_SYNTHETIC, DATA_SYNTHETIC,
+from config import (SEEDS, MODELS_DIR, DATA_SYNTHETIC,
                     TARGET_COL, CONTINUOUS_COLS)
 from utils.seed_utils import set_all_seeds
 from utils.results_aggregator import aggregate, print_table, print_significance
@@ -36,6 +36,12 @@ def run_model(model_name: str, seed: int, marginal_correction: bool = False) -> 
     For a given (model, seed): load existing checkpoint or train if missing,
     generate synthetic data, run the Four-Axis Audit, and return metrics.
 
+    Every model releases as many synthetic rows as there are training rows.
+    This is not cosmetic: the DOMIAS attack estimates the synthetic density
+    from exactly these rows, so the release size is a parameter of the attack.
+    At the old N_SYNTHETIC=1000 an AUC of ~0.5 is indistinguishable from an
+    underpowered attack — see experiments/mia_power.py.
+
     Args:
         model_name: 'vae' | 'ctgan' | 'tvae' | 'gc'
         seed: random seed integer
@@ -47,6 +53,8 @@ def run_model(model_name: str, seed: int, marginal_correction: bool = False) -> 
     """
     set_all_seeds(seed)
     ckpt = _ckpt_path(model_name, seed)
+    from generate import _load_real_train
+    n_synth = len(_load_real_train())
 
     if model_name in ("vae", "ctgan"):
         if not ckpt.exists():
@@ -59,24 +67,19 @@ def run_model(model_name: str, seed: int, marginal_correction: bool = False) -> 
                 from models.ctgan.train import train_ctgan
                 ckpt = train_ctgan(seed=seed)
         from generate import generate
-        synthetic = generate(model_name, ckpt, seed=seed,
+        synthetic = generate(model_name, ckpt, seed=seed, n=n_synth,
                              marginal_correction=marginal_correction)
 
     elif model_name in ("tvae", "gc"):
-        if model_name == "tvae":
-            from baselines.tvae_baseline import train_tvae as train_fn
-            from baselines.tvae_baseline import generate_tvae as gen_fn
-        else:
-            from baselines.gaussian_copula_baseline import train_gc as train_fn
-            from baselines.gaussian_copula_baseline import generate_gc as gen_fn
+        from baselines.sdv_baselines import train_sdv, generate_sdv
         if not ckpt.exists():
             log.info("No checkpoint found for %s seed=%d — training now...",
                      model_name, seed)
-            ckpt = train_fn(seed=seed)
-        synthetic = gen_fn(ckpt, n=N_SYNTHETIC, seed=seed)
+            ckpt = train_sdv(model_name, seed=seed)
+        synthetic = generate_sdv(model_name, ckpt, n=n_synth, seed=seed)
         # SDV emits continuous values for categorical columns — snap to valid
         # levels, same post-processing VAE/CTGAN get (fair comparison).
-        from generate import _discretize_categoricals, _load_real_train
+        from generate import _discretize_categoricals
         rt = _load_real_train()
         feats = [c for c in rt.columns if c != TARGET_COL]
         cats = [c for c in feats if c not in CONTINUOUS_COLS]
@@ -85,8 +88,8 @@ def run_model(model_name: str, seed: int, marginal_correction: bool = False) -> 
                          index=False)
         if marginal_correction:
             # SDV wrappers do not post-process; apply the ablation uniformly.
-            from generate import apply_marginal_correction, _load_real_train
-            synthetic = apply_marginal_correction(synthetic, _load_real_train())
+            from generate import apply_marginal_correction
+            synthetic = apply_marginal_correction(synthetic, rt)
             out = DATA_SYNTHETIC / f"{model_name}_synthetic_mc_seed{seed}.csv"
             synthetic.to_csv(out, index=False)
             log.info("Marginal-corrected (ablation) -> %s", out)
