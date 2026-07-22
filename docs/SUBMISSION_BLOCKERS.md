@@ -23,11 +23,23 @@ than the one already retracted. Every DOI gets checked by a human against the pu
 `evaluation/results/utility_per_class_*.csv` is written for every run and tabulated nowhere. §III-B
 now states the finding inline, but the results section still gates and tabulates only the macro ratio.
 
-State it with its control, or it overstates: severe-class (class 4) TSTR F1 is 0.000 for every
-generator — **and TRTR F1 is 0.000 too**, as it is for classes 2 and 3 under both protocols. The
-real-data baseline is equally unable to produce a usable minority-class F1, so this is a property of
-the class imbalance, not of synthetic data. The measure that separates them is class-4 AUC: TRTR
-0.765, CTGAN TSTR 0.566, GaussianCopula TSTR **0.391 — below chance**.
+State it with its control, or it overstates: for the severe class (class 4), RF/TSTR F1 was 0.000 in
+all 20 generator-seed runs. The RF/TRTR control also produced class-4 F1 = 0.000 in each of the five
+unique seed evaluations, showing that the zero-F1 outcome is not specific to synthetic training and is
+consistent with the combination of class imbalance and the classifier's decision threshold. Class-4
+AUC nevertheless separated the protocols: RF/TRTR achieved 0.775 ± 0.009, compared with 0.653 ± 0.065
+for CTGAN RF/TSTR and 0.479 ± 0.059 for GaussianCopula RF/TSTR (mean ± sample SD across five seeds;
+full per-model range below). The previously reported values 0.765, 0.566, and 0.391 were seed-42
+values; the CTGAN and GaussianCopula values were also the minima across their five seeds. GaussianCopula
+fell below 0.5 in only two of five seeds, so these results do not support a general below-chance claim.
+
+| Protocol | Class-4 AUC (mean ± sample SD, n=5 seeds) | Range |
+|---|---|---|
+| RF/TRTR | 0.775 ± 0.009 | 0.765–0.788 |
+| VAE RF/TSTR | 0.500 ± 0.000 | 0.500–0.500 |
+| CTGAN RF/TSTR | 0.653 ± 0.065 | 0.566–0.729 |
+| TVAE RF/TSTR | 0.575 ± 0.087 | 0.484–0.680 |
+| GaussianCopula RF/TSTR | 0.479 ± 0.059 | 0.391–0.535 |
 
 ### 3. Say plainly that aggregate utility does not imply rare-class utility
 
