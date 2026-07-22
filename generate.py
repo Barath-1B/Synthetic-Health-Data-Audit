@@ -26,8 +26,6 @@ Label (Depression_Severity) mechanisms:
 
 import argparse
 import logging
-import pickle
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -41,12 +39,6 @@ from models.ctgan.model import Generator
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
-
-
-def _load_scaler() -> tuple:
-    with open(config.SCALER_PATH, "rb") as f:
-        bundle = pickle.load(f)
-    return bundle["scaler"], bundle["continuous_cols"], bundle["feature_cols"]
 
 
 def _load_real_train() -> pd.DataFrame:

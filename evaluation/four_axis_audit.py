@@ -24,7 +24,6 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import config
 from config import (
     DATA_PROCESSED, EVAL_RESULTS,
     FAA_FIDELITY_SCORE, FAA_UTILITY_RATIO,
@@ -120,6 +119,7 @@ def run_audit(synthetic_df: pd.DataFrame, seed: int,
         "dcr_share_close":     dcr["dcr_share_close"],
         "mia_auc_domias":      mia["mia_auc_domias"],
         "mia_auc_domias_clf":  mia["mia_auc_domias_clf"],
+        "mia_tpr_at_fpr01":    mia["mia_tpr_at_fpr01"],
         "c2st_acc":            c2st_acc,
         "clinical_flags":      clinical_flags,
         "ax1_pass":            ax1_pass,

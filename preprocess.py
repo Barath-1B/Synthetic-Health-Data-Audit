@@ -11,7 +11,6 @@ Writes:
   data/processed/nhanes_val.csv     — 15% stratified split
   data/processed/nhanes_test.csv    — 15% stratified split
   data/processed/scaler.pkl         — fitted MinMaxScaler + column lists
-  data/processed/splits.pkl         — index arrays (legacy compatibility)
 
 Usage:
   python preprocess.py
@@ -119,8 +118,14 @@ def _categorise_severity(raw: int) -> int:
     return 4
 
 
-def build_dataset() -> pd.DataFrame:
-    """Load, merge, clean, and derive features. Returns cleaned DataFrame without leakage cols."""
+def build_dataset(drop_leakage: bool = True) -> pd.DataFrame:
+    """Load, merge, clean, and derive features.
+
+    drop_leakage=True (default): drop PHQ9_TOTAL + all 9 DPQ items (the leakage
+    fix used by every model). drop_leakage=False: keep the DPQ items as columns
+    so they can be treated as sensitive attributes (attribute-inference study);
+    still drops SEQN/PHQ9_RAW/PHQ9_TOTAL.
+    """
     log.info("Loading XPT files from %s ...", config.DATA_RAW)
     dpq    = _load_xpt("P_DPQ.xpt",    DPQ_COLS)
     demo   = _load_xpt("P_DEMO.xpt",   DEMO_COLS)
@@ -186,8 +191,9 @@ def build_dataset() -> pd.DataFrame:
     df["PHQ9_RAW"] = df[DPQ_ITEMS].sum(axis=1).astype(int)
     df["Depression_Severity"] = df["PHQ9_RAW"].apply(_categorise_severity).astype(int)
 
-    # Drop SEQN, PHQ9_RAW, PHQ9_TOTAL, and all DPQ items (leakage prevention)
-    drop_cols = ["SEQN", "PHQ9_RAW"] + LEAKAGE_COLS
+    # Drop SEQN, PHQ9_RAW, PHQ9_TOTAL, and (unless studying them) all DPQ items
+    drop_cols = (["SEQN", "PHQ9_RAW"] + LEAKAGE_COLS if drop_leakage
+                 else ["SEQN", "PHQ9_RAW", "PHQ9_TOTAL"])
     df = df.drop(columns=[c for c in drop_cols if c in df.columns])
 
     # Fill remaining missings with median
@@ -248,21 +254,6 @@ def main() -> None:
     test_df.to_csv(config.NHANES_TEST,  index=False)
     log.info("Splits saved -> train=%d, val=%d, test=%d",
              len(train_df), len(val_df), len(test_df))
-
-    # Legacy splits.pkl (index arrays into nhanes_clean.csv)
-    idx = np.arange(len(df))
-    idx_trainval, idx_test = train_test_split(
-        idx, test_size=1 - config.TRAIN_RATIO,
-        stratify=y, random_state=config.RANDOM_SEED,
-    )
-    val_frac_legacy = config.VAL_RATIO / (config.TRAIN_RATIO + config.VAL_RATIO)
-    idx_train, idx_val = train_test_split(
-        idx_trainval, test_size=val_frac_legacy,
-        stratify=y[idx_trainval], random_state=config.RANDOM_SEED,
-    )
-    with open(config.SPLITS_PATH, "wb") as f:
-        pickle.dump({"train": idx_train, "val": idx_val, "test": idx_test}, f)
-    log.info("Saved -> %s", config.SPLITS_PATH)
 
     log.info("\nShape: %s", df.shape)
     log.info("Feature columns (%d): %s", len(feature_cols), feature_cols)

@@ -72,6 +72,7 @@ def run_controls(seed: int = config.RANDOM_SEED) -> pd.DataFrame:
     rows.append({"control": "positive_noisy_copies",
                  "mia_auc_domias": mia_pos["mia_auc_domias"],
                  "mia_auc_domias_clf": mia_pos["mia_auc_domias_clf"],
+                 "mia_tpr_at_fpr01": mia_pos["mia_tpr_at_fpr01"],
                  "expected": f"> {POSITIVE_MIN_AUC}",
                  "pass": pos_pass})
 
@@ -88,6 +89,7 @@ def run_controls(seed: int = config.RANDOM_SEED) -> pd.DataFrame:
     rows.append({"control": "negative_fresh_real",
                  "mia_auc_domias": mia_neg["mia_auc_domias"],
                  "mia_auc_domias_clf": mia_neg["mia_auc_domias_clf"],
+                 "mia_tpr_at_fpr01": mia_neg["mia_tpr_at_fpr01"],
                  "expected": f"in {list(NEGATIVE_BAND)}",
                  "pass": neg_pass})
 

@@ -40,7 +40,7 @@ import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.model_selection import cross_val_score
 from sklearn.neighbors import KernelDensity
 
@@ -125,7 +125,7 @@ def _kde_log_density(fit: np.ndarray, score_on: np.ndarray) -> np.ndarray:
 
 def axis4_mia_domias(real_train: pd.DataFrame, real_test: pd.DataFrame,
                      synthetic: pd.DataFrame, reference: pd.DataFrame,
-                     seed: int = 42, n_eval_per_class: int = 500) -> dict:
+                     seed: int = 42, n_eval_per_class: int | None = None) -> dict:
     """
     DOMIAS density-ratio membership inference attack.
 
@@ -136,15 +136,23 @@ def axis4_mia_domias(real_train: pd.DataFrame, real_test: pd.DataFrame,
     density. Evaluated as ROC AUC on a balanced set of train members vs test
     non-members. AUC ~ 0.5 means the attack learns nothing.
 
+    n_eval_per_class defaults to the largest balanced set the splits allow
+    (min(|train|, |test|)) — capping it throws away attack power for nothing.
+
     Returns dict with:
       mia_auc_domias      KDE-based density-ratio attack AUC (the gating metric)
       mia_auc_domias_clf  classifier-based density-ratio AUC (sensitivity check)
+      mia_tpr_at_fpr01    TPR at FPR=0.01 (non-gating). An attack near chance in
+                          AUC can still succeed sharply on a few vulnerable
+                          records; AUC alone hides that. FPR=0.001 is NOT
+                          reported — with ~1.3k non-members it is ~1 negative.
     """
     feature_cols = [c for c in real_train.columns if c != config.TARGET_COL]
     rng = np.random.default_rng(seed)
 
-    n_mem  = min(n_eval_per_class, len(real_train))
-    n_non  = min(n_eval_per_class, len(real_test))
+    cap    = n_eval_per_class or min(len(real_train), len(real_test))
+    n_mem  = min(cap, len(real_train))
+    n_non  = min(cap, len(real_test))
     mem_idx = rng.choice(len(real_train), size=n_mem, replace=False)
     non_idx = rng.choice(len(real_test),  size=n_non, replace=False)
 
@@ -161,7 +169,11 @@ def axis4_mia_domias(real_train: pd.DataFrame, real_test: pd.DataFrame,
                                        syn_arr, ref_arr, targets)
     log_p_syn = _kde_log_density(syn_s, tgt_s)
     log_p_ref = _kde_log_density(ref_s, tgt_s)
-    auc_kde = float(roc_auc_score(y_true, log_p_syn - log_p_ref))
+    scores_kde = log_p_syn - log_p_ref
+    auc_kde = float(roc_auc_score(y_true, scores_kde))
+
+    fpr, tpr, _ = roc_curve(y_true, scores_kde)
+    tpr_at_fpr01 = float(np.interp(0.01, fpr, tpr))
 
     # Classifier-based density-ratio variant (sensitivity, non-gating):
     # P(synthetic | x) odds against the reference approximate p_syn/p_ref.
@@ -172,9 +184,12 @@ def axis4_mia_domias(real_train: pd.DataFrame, real_test: pd.DataFrame,
     proba = clf.predict_proba(targets)[:, 1].clip(1e-6, 1 - 1e-6)
     auc_clf = float(roc_auc_score(y_true, np.log(proba / (1 - proba))))
 
-    log.info("  MIA DOMIAS AUC (KDE): %.4f  [target <= %.2f] | clf variant: %.4f",
-             auc_kde, config.FAA_MIA_AUC, auc_clf)
-    return {"mia_auc_domias": auc_kde, "mia_auc_domias_clf": auc_clf}
+    log.info("  MIA DOMIAS AUC (KDE): %.4f  [target <= %.2f] | clf variant: %.4f "
+             "| TPR@FPR=0.01: %.4f  (n_eval=%d/%d, n_syn=%d)",
+             auc_kde, config.FAA_MIA_AUC, auc_clf, tpr_at_fpr01,
+             n_mem, n_non, len(syn_arr))
+    return {"mia_auc_domias": auc_kde, "mia_auc_domias_clf": auc_clf,
+            "mia_tpr_at_fpr01": tpr_at_fpr01}
 
 
 # ── Distinguishability (reported, non-gating) ────────────────────────────────
@@ -237,6 +252,7 @@ def main() -> None:
         "dcr_share_close": round(dcr["dcr_share_close"], 4),
         "mia_auc_domias": round(mia["mia_auc_domias"], 4),
         "mia_auc_domias_clf": round(mia["mia_auc_domias_clf"], 4),
+        "mia_tpr_at_fpr01": round(mia["mia_tpr_at_fpr01"], 4),
         "c2st_acc": round(c2st, 4),
     }
     out = config.EVAL_RESULTS / f"privacy_{args.model}_seed{args.seed}.csv"

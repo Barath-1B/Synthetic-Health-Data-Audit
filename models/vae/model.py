@@ -70,17 +70,8 @@ class VAE(nn.Module):
     """Variational Autoencoder combining Encoder and Decoder."""
 
     def __init__(self, input_dim: int, binary_col_indices: List[int],
-                 hidden_dims: List[int] = None, latent_dim: int = None) -> None:
+                 hidden_dims: List[int], latent_dim: int) -> None:
         super().__init__()
-        # Import here to avoid circular deps when model is used standalone
-        import sys
-        from pathlib import Path
-        _root = Path(__file__).resolve().parents[2]
-        sys.path.insert(0, str(_root))
-        import config as _cfg
-        hidden_dims = hidden_dims if hidden_dims is not None else _cfg.VAE_HIDDEN_DIMS
-        latent_dim  = latent_dim  if latent_dim  is not None else _cfg.VAE_LATENT_DIM
-
         self.encoder = Encoder(input_dim, hidden_dims, latent_dim)
         self.decoder = Decoder(latent_dim, hidden_dims, input_dim, binary_col_indices)
         self.latent_dim = latent_dim
@@ -104,11 +95,6 @@ class VAE(nn.Module):
         self.eval()
         z = torch.randn(n, self.latent_dim, device=device)
         return self.decoder(z)
-
-    @torch.no_grad()
-    def sample(self, n: int, device: torch.device) -> torch.Tensor:
-        """Alias for generate() — backwards compatibility."""
-        return self.generate(n, device)
 
 
 def vae_loss(
